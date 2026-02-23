@@ -40,12 +40,12 @@ def load_class_names_from_csv(csv_file):
 
 # -------------------- 固定加载本地模型与类别 --------------------
 
-DEFAULT_MODEL_PATH = "best_model.pth"
+DEFAULT_MODEL_PATH = "best_model(1).pth"
 DEFAULT_CSV_PATH   = "Train_Ready.csv"
 
 # 检查文件是否存在
 if not os.path.exists(DEFAULT_MODEL_PATH):
-    st.error("❌ 未找到模型文件 best_model.pth")
+    st.error("❌ 未找到模型文件 best_model(1).pth")
     st.stop()
 
 if not os.path.exists(DEFAULT_CSV_PATH):
@@ -152,4 +152,5 @@ st.markdown("---")
 st.markdown("""
 **使用说明**  
 请上传您的发病部位的清晰图片，系统将为您诊断出最可能的皮肤病类型  
+
 """)
