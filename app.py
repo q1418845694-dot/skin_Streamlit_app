@@ -1,157 +1,272 @@
+import os
+import io
+import numpy as np
+import pandas as pd
 import streamlit as st
+from PIL import Image
+
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
-from PIL import Image
 import timm
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import os
 
-# -------------------- 页面配置 --------------------
-st.set_page_config(
-    page_title="皮肤病智能识别 - Swin Transformer",
-    page_icon="🩺",
-    layout="wide"
-)
 
-st.title("🩺 皮肤病智能识别系统 (Swin Transformer)")
-st.markdown("上传皮肤镜图像，模型将预测其所属的病变类别。")
+# =========================
+# 1) 配置（按你的路径改）
+# =========================
+class Config:
+    MODEL_NAME = "swin_tiny_patch4_window7_224"
+    IMG_SIZE = 224
 
-# -------------------- 全局缓存 --------------------
+    # 你的权重文件
+    MODEL_WEIGHTS = r"E:/SkinViT_Project/Results/best_model.pth"
+
+    # 读取类别的方式（二选一）
+    # A: 用 Train_Ready.csv 自动读取 Label 列（推荐：与你训练一致）
+    CSV_PATH = r"E:/SkinViT_Project/Skin_Dataset/Train_Ready.csv"
+
+    # B: 或者你可以准备一个 classes.txt（每行一个类别名），然后改成该路径
+    CLASSES_TXT = None  # 例如 r"E:/SkinViT_Project/Results/classes.txt"
+
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    TOPK = 5
+
+
+# =========================
+# 2) 工具函数：加载类别
+# =========================
+@st.cache_data
+def load_classes(csv_path: str, classes_txt: str | None):
+    if classes_txt and os.path.exists(classes_txt):
+        with open(classes_txt, "r", encoding="utf-8") as f:
+            classes = [line.strip() for line in f.readlines() if line.strip()]
+        return classes
+
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    if "Label" not in df.columns:
+        raise ValueError(f"CSV must contain 'Label' column, got columns: {list(df.columns)}")
+
+    classes = sorted(df["Label"].unique().tolist())
+    return classes
+
+
+# =========================
+# 3) 推理预处理（与你验证集一致）
+# =========================
 @st.cache_resource
-def load_model(model_path, num_classes, device):
-    """加载 Swin Transformer 模型"""
-    model = timm.create_model('swin_tiny_patch4_window7_224', pretrained=False, num_classes=num_classes)
-    state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict)
-    model = model.to(device)
+def get_transform():
+    return transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop((Config.IMG_SIZE, Config.IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ])
+
+
+# =========================
+# 4) 加载模型
+# =========================
+@st.cache_resource
+def load_model(num_classes: int):
+    model = timm.create_model(
+        Config.MODEL_NAME,
+        pretrained=False,          # 推理用你自己的权重，不用预训练权重
+        num_classes=num_classes
+    )
+
+    if not os.path.exists(Config.MODEL_WEIGHTS):
+        raise FileNotFoundError(f"Model weights not found: {Config.MODEL_WEIGHTS}")
+
+    state = torch.load(Config.MODEL_WEIGHTS, map_location="cpu")
+    model.load_state_dict(state, strict=True)
+
+    model.to(Config.DEVICE)
     model.eval()
     return model
 
-@st.cache_data
-def load_class_names_from_csv(csv_file):
-    """从训练时使用的 CSV 文件中提取类别名称（与训练时顺序一致）"""
-    df = pd.read_csv(csv_file)
-    classes = sorted(list(df['Label'].unique()))   # 训练时也是 sorted
-    return classes
 
-# -------------------- 固定加载本地模型与类别 --------------------
+# =========================
+# 5) Grad-CAM（简单版）
+#   - 对 Swin/ViT CAM 不是完美，但能做一个“可用的热力图”
+# =========================
+def compute_cam_swin(model, input_tensor, class_idx: int):
+    """
+    返回 heatmap (H, W) in [0,1]
+    说明：对 timm 的 Swin，我们尝试hook最后一个stage输出特征。
+    """
+    feats = {}
+    grads = {}
 
-DEFAULT_MODEL_PATH = "best_model.pth"
-DEFAULT_CSV_PATH   = "Train_Ready.csv"
+    # timm Swin 通常有 model.layers[-1].blocks[-1] 或 model.layers[-1] 可hook
+    # 为了稳健：优先 hook model.layers[-1]
+    target_module = None
+    if hasattr(model, "layers") and len(model.layers) > 0:
+        target_module = model.layers[-1]
+    else:
+        # 兜底：hook 倒数第二层模块
+        modules = list(model.modules())
+        target_module = modules[-2]
 
-# 检查文件是否存在
-if not os.path.exists(DEFAULT_MODEL_PATH):
-    st.error("❌ 未找到模型文件 best_model.pth")
-    st.stop()
+    def fwd_hook(module, inp, out):
+        feats["value"] = out
 
-if not os.path.exists(DEFAULT_CSV_PATH):
-    st.error("❌ 未找到 Train_Ready.csv 文件")
-    st.stop()
+    def bwd_hook(module, grad_in, grad_out):
+        grads["value"] = grad_out[0]
 
-# 读取类别
-class_names = load_class_names_from_csv(DEFAULT_CSV_PATH)
+    h1 = target_module.register_forward_hook(fwd_hook)
+    h2 = target_module.register_full_backward_hook(bwd_hook)
 
-# 加载模型
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = load_model(DEFAULT_MODEL_PATH, len(class_names), device)
+    model.zero_grad(set_to_none=True)
+    logits = model(input_tensor)
+    score = logits[:, class_idx].sum()
+    score.backward()
 
-st.sidebar.markdown("### ⚙️ 系统信息")
-st.sidebar.markdown(f"类别数量: {len(class_names)}")
-st.sidebar.markdown(f"运行设备: `{device}`")
+    h1.remove()
+    h2.remove()
 
-# -------------------- 图像预处理 --------------------
-# 严格对齐验证集预处理
-val_transform = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
+    if "value" not in feats or "value" not in grads:
+        return None
 
-# -------------------- 主界面：图像上传与预测 --------------------
-col1, col2 = st.columns([1, 1])
+    f = feats["value"]
+    g = grads["value"]
 
-with col1:
-    uploaded_img = st.file_uploader(
-        "📤 上传皮肤镜图像",
-        type=['jpg', 'jpeg', 'png', 'bmp', 'tiff'],
-        help="支持常见图像格式"
-    )
+    # Swin的特征可能是 (B, H, W, C) 或 (B, N, C) 或 (B, C, H, W)
+    # 做一些兼容处理
+    if f.dim() == 4 and f.shape[1] != 3 and f.shape[1] < 32 and f.shape[-1] > 32:
+        # 可能是 (B, H, W, C)
+        # 转成 (B, C, H, W)
+        f = f.permute(0, 3, 1, 2).contiguous()
+        g = g.permute(0, 3, 1, 2).contiguous()
+    elif f.dim() == 3:
+        # (B, N, C) -> 估算成 sqrt(N) 的 2D
+        B, N, C = f.shape
+        side = int(np.sqrt(N))
+        if side * side == N:
+            f = f.permute(0, 2, 1).contiguous().view(B, C, side, side)
+            g = g.permute(0, 2, 1).contiguous().view(B, C, side, side)
+        else:
+            return None
 
-    if uploaded_img is not None:
-        # 显示原图
-        image = Image.open(uploaded_img).convert('RGB')
-        st.image(image, caption="原始图像", use_column_width=True)
+    if f.dim() != 4:
+        return None
 
-if uploaded_img is not None and model is not None:
+    # Grad-CAM: channel-wise weight = global avg pool of grads
+    weights = g.mean(dim=(2, 3), keepdim=True)  # (B,C,1,1)
+    cam = (weights * f).sum(dim=1, keepdim=False)  # (B,H,W)
+    cam = F.relu(cam)
+
+    # normalize to [0,1]
+    cam = cam[0]
+    cam = cam - cam.min()
+    if cam.max() > 1e-6:
+        cam = cam / cam.max()
+    return cam.detach().cpu().numpy()
+
+
+def overlay_heatmap_on_image(img_pil: Image.Image, heatmap: np.ndarray, alpha=0.45):
+    """
+    把 heatmap 叠加到原图上，返回叠加后的 PIL
+    """
+    import matplotlib.cm as cm
+
+    img = img_pil.convert("RGB")
+    w, h = img.size
+    hm = Image.fromarray((heatmap * 255).astype(np.uint8)).resize((w, h), Image.BILINEAR)
+    hm_np = np.array(hm) / 255.0
+    colored = cm.jet(hm_np)[:, :, :3]  # (H,W,3)
+    colored = (colored * 255).astype(np.uint8)
+    colored_img = Image.fromarray(colored)
+
+    blended = Image.blend(img, colored_img, alpha=alpha)
+    return blended
+
+
+# =========================
+# 6) Streamlit UI
+# =========================
+def main():
+    st.set_page_config(page_title="Skin Disease Recognition (Swin)", layout="wide")
+
+    st.title("🩺 Skin Disease Image Recognition (Swin Transformer)")
+    st.caption("Upload a skin lesion image, the model will predict the class and show Top-K probabilities.")
+
+    # Sidebar
+    st.sidebar.header("Settings")
+    topk = st.sidebar.slider("Top-K", min_value=1, max_value=10, value=Config.TOPK)
+    show_cam = st.sidebar.checkbox("Show heatmap (Grad-CAM)", value=True)
+    alpha = st.sidebar.slider("Heatmap alpha", 0.0, 1.0, 0.45, 0.05)
+
+    # Load classes & model
+    try:
+        classes = load_classes(Config.CSV_PATH, Config.CLASSES_TXT)
+        model = load_model(num_classes=len(classes))
+        tfm = get_transform()
+    except Exception as e:
+        st.error(f"❌ Failed to load model/classes: {e}")
+        st.stop()
+
+    st.sidebar.success(f"Device: {Config.DEVICE}")
+    st.sidebar.info(f"Classes: {len(classes)}")
+    st.sidebar.write("Model:", Config.MODEL_NAME)
+
+    uploaded = st.file_uploader("Upload an image (jpg/png)", type=["jpg", "jpeg", "png"])
+
+    if not uploaded:
+        st.info("Please upload an image to start.")
+        return
+
+    # Read image
+    image_bytes = uploaded.read()
+    img_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    # Layout
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("Input Image")
+        st.image(img_pil, use_container_width=True)
+
+    # Prepare input tensor
+    x = tfm(img_pil).unsqueeze(0).to(Config.DEVICE)
+
+    # Predict
+    with torch.no_grad():
+        logits = model(x)
+        probs = F.softmax(logits, dim=1)[0].detach().cpu().numpy()
+
+    # Top-k
+    k = min(topk, len(classes))
+    top_idx = np.argsort(probs)[::-1][:k]
+    top_items = [(classes[i], float(probs[i])) for i in top_idx]
+
+    pred_label, pred_prob = top_items[0]
+
     with col2:
-        st.subheader("🔍 预测结果")
+        st.subheader("Prediction")
+        st.markdown(f"### ✅ Predicted: **{pred_label}**")
+        st.markdown(f"**Confidence:** `{pred_prob:.4f}`")
 
-        # 预处理
-        input_tensor = val_transform(image).unsqueeze(0).to(device)
+        st.write("Top-K probabilities:")
+        df_show = pd.DataFrame(top_items, columns=["Class", "Probability"])
+        st.dataframe(df_show, use_container_width=True)
 
-        # 推理
-        with torch.no_grad():
-            outputs = model(input_tensor)
-            probabilities = F.softmax(outputs, dim=1)
-            top5_prob, top5_idx = torch.topk(probabilities, 5)
+        st.bar_chart(df_show.set_index("Class"))
 
-        # 转换为 numpy
-        top5_prob = top5_prob.cpu().numpy()[0]
-        top5_idx  = top5_idx.cpu().numpy()[0]
-        top5_labels = [class_names[i] for i in top5_idx]
+    # Heatmap
+    if show_cam:
+        st.subheader("Heatmap (Grad-CAM)")
+        class_idx = classes.index(pred_label)
+        cam = compute_cam_swin(model, x, class_idx=class_idx)
+        if cam is None:
+            st.warning("Heatmap generation failed for this model structure. (Swin/ViT CAM may require custom hooks.)")
+        else:
+            overlay = overlay_heatmap_on_image(img_pil, cam, alpha=alpha)
+            st.image(overlay, caption="CAM overlay", use_container_width=True)
 
-        # 显示 Top-1 结果
-        st.markdown(f"### 🥇 预测: **{top5_labels[0]}**")
-        st.markdown(f"置信度: **{top5_prob[0]:.2%}**")
 
-        # 显示 Top-5 条形图
-        fig, ax = plt.subplots(figsize=(6, 3))
-        colors = sns.color_palette("Blues_d", len(top5_prob))
-        y_pos = np.arange(len(top5_labels))
-        ax.barh(y_pos, top5_prob, color=colors)
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels(top5_labels, fontsize=10)
-        ax.invert_yaxis()
-        ax.set_xlabel("置信度")
-        ax.set_title("Top-5 预测")
-        ax.set_xlim(0, 1)
-        for i, (prob, label) in enumerate(zip(top5_prob, top5_labels)):
-            ax.text(prob + 0.01, i, f"{prob:.2%}", va='center')
-
-        st.pyplot(fig)
-
-        # 可选：显示所有类别置信度的迷你条形图（折叠）
-        with st.expander("📊 查看所有类别的置信度分布"):
-            all_prob = probabilities.cpu().numpy()[0]
-            # 按置信度降序排序
-            sorted_indices = np.argsort(all_prob)[::-1]
-            sorted_labels = [class_names[i] for i in sorted_indices[:10]]  # 只显示前10
-            sorted_probs = all_prob[sorted_indices[:10]]
-
-            fig2, ax2 = plt.subplots(figsize=(8, 4))
-            ax2.barh(np.arange(len(sorted_labels)), sorted_probs, color='lightcoral')
-            ax2.set_yticks(np.arange(len(sorted_labels)))
-            ax2.set_yticklabels(sorted_labels, fontsize=9)
-            ax2.invert_yaxis()
-            ax2.set_xlabel("置信度")
-            ax2.set_title("Top-10 类别")
-            ax2.set_xlim(0, 1)
-            st.pyplot(fig2)
-
-else:
-    with col2:
-        st.info("👈 请先上传一张皮肤图像")
-
-# -------------------- 页脚说明 --------------------
-st.markdown("---")
-st.markdown("""
-**使用说明**  
-请上传您的发病部位的清晰图片，系统将为您诊断出最可能的皮肤病类型  
-
-""")
-
+if __name__ == "__main__":
+    main()
