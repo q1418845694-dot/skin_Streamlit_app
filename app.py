@@ -53,7 +53,7 @@ def load_model(num_classes: int):
         pretrained=False,
         num_classes=num_classes
     )
-    state = torch.load(Config.MODEL_WEIGHTS, map_location="cpu")
+state = torch.load(Config.MODEL_WEIGHTS, map_location="cpu", weights_only=False)
     model.load_state_dict(state, strict=True)
     model.to(Config.DEVICE)
     model.eval()
@@ -114,3 +114,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
