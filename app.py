@@ -19,11 +19,11 @@ class Config:
     IMG_SIZE = 224
 
     # 你的权重文件
-    MODEL_WEIGHTS = r"E:/SkinViT_Project/Results/best_model.pth"
+    MODEL_WEIGHTS = r"best_model.pth"
 
     # 读取类别的方式（二选一）
     # A: 用 Train_Ready.csv 自动读取 Label 列（推荐：与你训练一致）
-    CSV_PATH = r"E:/SkinViT_Project/Skin_Dataset/Train_Ready.csv"
+    CSV_PATH = r"Train_Ready.csv"
 
     # B: 或者你可以准备一个 classes.txt（每行一个类别名），然后改成该路径
     CLASSES_TXT = None  # 例如 r"E:/SkinViT_Project/Results/classes.txt"
@@ -270,3 +270,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
